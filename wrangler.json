@@ -1,0 +1,40 @@
+{
+  "name": "comment-to-dm",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-10-01",
+  "workers_dev": false,
+  "preview_urls": false,
+  "observability": {
+    "enabled": true
+  },
+  "vars": {
+    "GRAPH_VERSION": "v26.0",
+    "IG_ACCOUNT_ID": "YOUR_INSTAGRAM_ACCOUNT_ID",
+    "ALERT_FROM": "Comment DMs <alerts@example.com>",
+    "ALERT_TO": "you@example.com",
+    "OWNER_NAME": "Your Name",
+    "INSTAGRAM_HANDLE": "@yourhandle",
+    "CONTACT_EMAIL": "you@example.com",
+    "POLICY_DATE": "January 1, 2027"
+  },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "comment-to-dm",
+      "database_id": "YOUR_D1_DATABASE_ID",
+      "migrations_dir": "migrations"
+    }
+  ],
+  "routes": [
+    {
+      "pattern": "YOUR_SUBDOMAIN.example.com",
+      "custom_domain": true
+    }
+  ],
+  "triggers": {
+    "crons": [
+      "0 15 * * *",
+      "30 * * * *"
+    ]
+  }
+}

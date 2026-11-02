@@ -1,0 +1,19 @@
+[
+  {
+    "keyword": "guide",
+    "message": "Here's the guide from the reel",
+    "button": {
+      "title": "Open the guide",
+      "url": "https://example.com/guide"
+    },
+    "loose": true
+  },
+  {
+    "keyword": "ui",
+    "message": "Here's the link from the reel",
+    "button": {
+      "title": "Open the link",
+      "url": "https://example.com/ui"
+    }
+  }
+]
