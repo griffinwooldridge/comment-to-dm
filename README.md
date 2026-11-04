@@ -141,7 +141,7 @@ npm test && npm run deploy
 }
 ```
 
-By default the comment must be only the keyword, so `ui` fires on "UI!" but not on "love this ui". Add `"loose": true` to match the word anywhere in a comment, and only use that for words people rarely type by accident.
+By default the comment must be only the keyword, so `ui` fires on "UI!" but not on "love this ui". Add `"loose": true` to match the word anywhere in a comment of up to four words, so "mobbin please" fires but a longer sentence that mentions it does not. Only use it for words people rarely type by accident.
 
 Keep each message a little different, since many identical link messages look like spam. Meta allows one private reply per comment, within 7 days of the comment. Comments made before you add a keyword get no DM.
 

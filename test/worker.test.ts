@@ -110,7 +110,7 @@ test('a keyword only matches when it is the whole comment', () => {
 test('a loose keyword matches as a whole word anywhere', () => {
   const list = [{ keyword: 'guide', message: 'x', loose: true }];
   for (const text of ['guide', 'GUIDE', 'guide please', 'I want Guide.', 'Guide 🙏']) assert.ok(matchKeyword(text, list), text);
-  for (const text of ['guides', 'notguide', 'nice video', '']) assert.equal(matchKeyword(text, list), undefined, text);
+  for (const text of ['guides', 'notguide', 'nice video', '', "guide isn't exactly cheap for us"]) assert.equal(matchKeyword(text, list), undefined, text);
 });
 
 test('ignores your own comments and non-matching comments', async () => {

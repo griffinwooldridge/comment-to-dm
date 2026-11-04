@@ -71,12 +71,15 @@ export async function validSignature(secret: string, body: string, header: strin
   return safeEqual(expected, header);
 }
 
+/** Longer comments are usually conversation, like "mobbin isn't cheap for us", not a request for the link. */
+const LOOSE_MAX_WORDS = 4;
+
 /** Case-insensitive. The comment must be only the keyword, unless the keyword is loose. */
 export function matchKeyword(text: string, list: Keyword[]): Keyword | undefined {
   const words = text.toLowerCase().split(/[^\p{L}\p{N}]+/u).filter(Boolean);
   return list.find(({ keyword, loose }) => {
     const word = keyword.toLowerCase();
-    return loose ? words.includes(word) : words.length === 1 && words[0] === word;
+    return loose ? words.length <= LOOSE_MAX_WORDS && words.includes(word) : words.length === 1 && words[0] === word;
   });
 }
 
