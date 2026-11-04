@@ -82,7 +82,7 @@ test('fails closed when a secret is missing', async () => {
 });
 
 test('reads both comment payload shapes Meta documents', () => {
-  const expected = [{ id: 'c1', text: 'hi', commenterId: '200', mediaId: 'm1', accountId: ACCOUNT }];
+  const expected = [{ id: 'c1', text: 'hi', commenterId: '200', mediaId: 'm1', accountId: ACCOUNT, platform: 'instagram' }];
   const from = { id: '200' };
   const media = { id: 'm1' };
   const nested = { entry: [{ id: ACCOUNT, changes: [{ field: 'comments', value: { comment_id: 'c1', text: 'hi', from, media } }] }] };
@@ -159,7 +159,7 @@ test('serves the privacy policy', async () => {
 });
 
 const buttonList = [{ keyword: 'ui', message: 'Here you go', button: { title: 'Open', url: 'https://example.com' } }];
-const comment = { id: 'c1', text: 'ui', commenterId: '200', mediaId: 'm1', accountId: ACCOUNT };
+const comment = { id: 'c1', text: 'ui', commenterId: '200', mediaId: 'm1', accountId: ACCOUNT, platform: 'instagram' as const };
 
 test('a keyword with a button sends a button template', async () => {
   assert.equal(await handleComment(env, comment, buttonList), true);
@@ -224,4 +224,89 @@ test('a healthy account reports nothing', async () => {
 test('only /webhook and /privacy exist', async () => {
   assert.equal((await worker.fetch(new Request('https://ig.test/'), env)).status, 404);
   assert.equal((await worker.fetch(new Request('https://ig.test/webhook', { method: 'PUT' }), env)).status, 405);
+});
+
+const PAGE = '900';
+
+function pageEvent(message: string, overrides: Record<string, string> = {}) {
+  const { commentId = 'p1_c1', from = '300', verb = 'add', item = 'comment' } = overrides;
+  return { object: 'page', entry: [{ id: PAGE, changes: [{ field: 'feed', value: { item, verb, comment_id: commentId, post_id: `${PAGE}_p1`, message, from: { id: from, name: 'Someone' } } }] }] };
+}
+
+test('reads new Facebook Page comments and ignores other feed changes', () => {
+  assert.deepEqual(parseComments(pageEvent('guide')), [
+    { id: 'p1_c1', text: 'guide', commenterId: '300', mediaId: `${PAGE}_p1`, accountId: PAGE, platform: 'facebook' },
+  ]);
+  assert.deepEqual(parseComments(pageEvent('guide', { verb: 'edited' })), []);
+  assert.deepEqual(parseComments(pageEvent('guide', { item: 'reaction' })), []);
+});
+
+test('answers a Facebook comment from the Page with the Page token', async () => {
+  env.FB_PAGE_TOKEN = 'page-token';
+  assert.equal((await post(pageEvent('guide'))).status, 200);
+  assert.equal(sent.length, 1);
+  assert.equal(sent[0].url, `https://graph.test/v26.0/${PAGE}/messages`);
+  assert.equal(sent[0].auth, 'Bearer page-token');
+  assert.deepEqual(sent[0].body.recipient, { comment_id: 'p1_c1' });
+  assert.equal(rows()[0].status, 'sent');
+});
+
+test('skips Facebook comments until a Page token is set, and the Page\'s own comments', async () => {
+  assert.equal((await post(pageEvent('guide'))).status, 200);
+  env.FB_PAGE_TOKEN = 'page-token';
+  assert.equal((await post(pageEvent('guide', { from: PAGE }))).status, 200);
+  assert.equal(sent.length, 0);
+  assert.equal(rows().length, 0);
+});
+
+test('flags a Facebook Page that lost its feed subscription', async () => {
+  env.FB_PAGE_ID = PAGE;
+  env.FB_PAGE_TOKEN = 'page-token';
+  const subscribed = (fields: string[]) => new Response(JSON.stringify({ data: [{ subscribed_fields: fields }] }));
+  graphResponses = [subscribed(['comments']), subscribed([])];
+  assert.match((await findProblems(env))[0], /Facebook Page is no longer subscribed/);
+  assert.equal(sent[1].url, `https://graph.test/v26.0/${PAGE}/subscribed_apps`);
+  assert.equal(sent[1].auth, 'Bearer page-token');
+  graphResponses = [subscribed(['comments']), subscribed(['feed'])];
+  assert.deepEqual(await findProblems(env), []);
+});
+
+function backfill(init: RequestInit & { query?: string } = {}, key = 'admin-key') {
+  return worker.fetch(new Request(`https://ig.test/admin/backfill${init.query ?? ''}`, { ...init, headers: { authorization: `Bearer ${key}` } }), env);
+}
+
+test('backfill refuses callers without the admin key', async () => {
+  assert.equal((await backfill()).status, 403);
+  env.ADMIN_KEY = 'admin-key';
+  assert.equal((await backfill({}, 'wrong')).status, 403);
+  assert.equal(sent.length, 0);
+});
+
+test('backfill lists unanswered keyword comments from the last week', async () => {
+  env.ADMIN_KEY = 'admin-key';
+  const now = new Date().toISOString();
+  const old = new Date(Date.now() - 8 * 86400000).toISOString();
+  graphResponses = [new Response(JSON.stringify({ data: [
+    { id: 'c1', text: 'guide', timestamp: now, from: { id: '200', username: 'a' } },
+    { id: 'c2', text: 'guide', timestamp: old, from: { id: '201', username: 'b' } },
+    { id: 'c3', text: 'nice', timestamp: now, from: { id: '202', username: 'c' } },
+  ] }))];
+  const res = await (await backfill({ query: '?platform=instagram&post=m1' })).json() as any;
+  assert.deepEqual(res.candidates.map((c: any) => c.comment), ['c1']);
+  assert.equal(res.recent, 2);
+});
+
+test('backfill send re-reads the comment and replies through the normal path', async () => {
+  env.ADMIN_KEY = 'admin-key';
+  graphResponses = [
+    new Response(JSON.stringify({ id: 'c1', text: 'guide', timestamp: new Date().toISOString(), from: { id: '200' }, media: { id: 'm1' } })),
+    new Response('{}'),
+  ];
+  const res = await (await backfill({ method: 'POST', body: JSON.stringify({ platform: 'instagram', post: 'm1', comment: 'c1' }) })).json() as any;
+  assert.equal(res.status, 'sent');
+  assert.equal(sent[1].url, `https://graph.test/v26.0/${ACCOUNT}/messages`);
+  graphResponses = [new Response(JSON.stringify({ id: 'c9', text: 'guide', timestamp: new Date().toISOString(), from: { id: '200' }, media: { id: 'other' } }))];
+  const wrongPost = await (await backfill({ method: 'POST', body: JSON.stringify({ platform: 'instagram', post: 'm1', comment: 'c9' }) })).json() as any;
+  assert.equal(wrongPost.status, 'mismatch');
+  assert.equal(sent.length, 3);
 });

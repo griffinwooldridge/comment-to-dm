@@ -8,12 +8,17 @@ export interface Env {
   WEBHOOK_VERIFY_TOKEN?: string;
   RESEND_API_KEY?: string;
   IG_ACCOUNT_ID?: string;
+  FB_PAGE_ID?: string;
+  FB_PAGE_TOKEN?: string;
+  /** Guards /admin/backfill. Only the owner's backfill script holds it. */
+  ADMIN_KEY?: string;
   ALERT_FROM?: string;
-  ALERT_TO?: string;
   OWNER_NAME?: string;
   INSTAGRAM_HANDLE?: string;
+  FACEBOOK_PAGE?: string;
   CONTACT_EMAIL?: string;
   POLICY_DATE?: string;
+  ALERT_TO?: string;
   GRAPH_VERSION?: string;
   GRAPH_BASE?: string;
   RESEND_BASE?: string;
@@ -34,6 +39,7 @@ interface Comment {
   commenterId: string;
   mediaId: string;
   accountId: string;
+  platform: 'instagram' | 'facebook';
 }
 
 /** Meta's rate-limit codes. These are worth retrying; a bad token or expired comment is not. */
@@ -74,7 +80,10 @@ export function matchKeyword(text: string, list: Keyword[]): Keyword | undefined
   });
 }
 
-/** Meta documents two shapes: changes[] with comment_id, and field/value on the entry with id. */
+/**
+ * Instagram documents two shapes: changes[] with comment_id, and field/value on the entry with id.
+ * Facebook Pages send new comments as feed changes with item "comment" and verb "add".
+ */
 export function parseComments(payload: unknown): Comment[] {
   const entries = (payload as { entry?: unknown[] })?.entry;
   if (!Array.isArray(entries)) return [];
@@ -82,6 +91,18 @@ export function parseComments(payload: unknown): Comment[] {
   for (const entry of entries as { id?: string; field?: string; value?: any; changes?: { field?: string; value?: any }[] }[]) {
     for (const change of entry.changes ?? [entry]) {
       const value = change.value;
+      if (change.field === 'feed') {
+        if (value?.item !== 'comment' || value.verb !== 'add' || !value.comment_id || !value.from?.id || !value.post_id || !entry.id) continue;
+        comments.push({
+          id: String(value.comment_id),
+          text: String(value.message ?? ''),
+          commenterId: String(value.from.id),
+          mediaId: String(value.post_id),
+          accountId: String(entry.id),
+          platform: 'facebook',
+        });
+        continue;
+      }
       const id = value?.comment_id ?? value?.id;
       if (change.field !== 'comments' || !id || !value.from?.id || !value.media?.id || !entry.id) continue;
       comments.push({
@@ -90,6 +111,7 @@ export function parseComments(payload: unknown): Comment[] {
         commenterId: String(value.from.id),
         mediaId: String(value.media.id),
         accountId: String(entry.id),
+        platform: 'instagram',
       });
     }
   }
@@ -98,6 +120,10 @@ export function parseComments(payload: unknown): Comment[] {
 
 function graphBase(env: Env): string {
   return env.GRAPH_BASE ?? 'https://graph.facebook.com';
+}
+
+function tokenFor(env: Env, platform: Comment['platform']): string | undefined {
+  return platform === 'facebook' ? env.FB_PAGE_TOKEN : env.IG_ACCESS_TOKEN;
 }
 
 function buttonMessage(match: Keyword, button: NonNullable<Keyword['button']>) {
@@ -109,7 +135,7 @@ async function sendPrivateReply(env: Env, comment: Comment, message: unknown): P
   try {
     res = await fetch(`${graphBase(env)}/${env.GRAPH_VERSION ?? 'v26.0'}/${comment.accountId}/messages`, {
       method: 'POST',
-      headers: { authorization: `Bearer ${env.IG_ACCESS_TOKEN}`, 'content-type': 'application/json' },
+      headers: { authorization: `Bearer ${tokenFor(env, comment.platform)}`, 'content-type': 'application/json' },
       body: JSON.stringify({ recipient: { comment_id: comment.id }, message }),
     });
   } catch {
@@ -128,6 +154,10 @@ async function sendPrivateReply(env: Env, comment: Comment, message: unknown): P
 /** Returns false when Meta should redeliver the event. */
 export async function handleComment(env: Env, comment: Comment, list: Keyword[]): Promise<boolean> {
   if (comment.commenterId === comment.accountId) return true;
+  if (!tokenFor(env, comment.platform)) {
+    console.error('dm_not_configured', comment.platform);
+    return true;
+  }
   const match = matchKeyword(comment.text, list);
   if (!match) return true;
 
@@ -184,9 +214,9 @@ async function handleEvent(request: Request, env: Env): Promise<Response> {
   return new Response(results.every(Boolean) ? 'OK' : 'Retry', { status: results.every(Boolean) ? 200 : 503 });
 }
 
-async function graphGet(env: Env, path: string): Promise<{ ok: boolean; status: number; body: any }> {
-  const res = await fetch(`${graphBase(env)}/${env.GRAPH_VERSION ?? 'v26.0'}/${env.IG_ACCOUNT_ID}/${path}`, {
-    headers: { authorization: `Bearer ${env.IG_ACCESS_TOKEN}` },
+async function graphGet(env: Env, path: string, id = env.IG_ACCOUNT_ID, token = env.IG_ACCESS_TOKEN): Promise<{ ok: boolean; status: number; body: any }> {
+  const res = await fetch(`${graphBase(env)}/${env.GRAPH_VERSION ?? 'v26.0'}/${id}${path ? `/${path}` : ''}`, {
+    headers: { authorization: `Bearer ${token}` },
   });
   return { ok: res.ok, status: res.status, body: await res.json().catch(() => ({})) };
 }
@@ -234,6 +264,14 @@ export async function findProblems(env: Env): Promise<string[]> {
   } else if (!subscribed.body.data?.some((app: any) => app.subscribed_fields?.includes('comments'))) {
     problems.push('The Instagram account is no longer subscribed to comments, so no DMs will send. See "Subscribe the account" in the README.');
   }
+  if (env.FB_PAGE_ID && env.FB_PAGE_TOKEN) {
+    const page = await graphGet(env, 'subscribed_apps', env.FB_PAGE_ID, env.FB_PAGE_TOKEN).catch(() => null);
+    if (!page?.ok) {
+      problems.push(`Meta rejected the Facebook Page health check (status ${page?.status ?? 'network error'}). The Page token may have stopped working.`);
+    } else if (!page.body.data?.some((app: any) => app.subscribed_fields?.includes('feed'))) {
+      problems.push('The Facebook Page is no longer subscribed to feed, so no Facebook DMs will send. See "Facebook Page" in the README.');
+    }
+  }
   const { results } = await env.DB.prepare(
     `SELECT keyword, error, COUNT(*) AS total FROM deliveries
      WHERE status = 'failed' AND created_at >= datetime('now', '-1 day') GROUP BY keyword, error`,
@@ -247,9 +285,97 @@ export async function checkHealth(env: Env): Promise<void> {
   if (problems.length) await sendAlert(env, 'Comment DMs need attention', problems);
 }
 
+/** Meta only allows a private reply within 7 days of the comment. Six and a half leaves room for a slow run. */
+const BACKFILL_MAX_AGE_MS = 6.5 * 24 * 60 * 60 * 1000;
+
+interface FetchedComment {
+  id: string;
+  text: string;
+  commenterId?: string;
+  username?: string;
+  postId?: string;
+  createdAt: string;
+}
+
+function readComment(platform: Comment['platform'], raw: any): FetchedComment {
+  return platform === 'facebook'
+    ? { id: String(raw.id), text: String(raw.message ?? ''), commenterId: raw.from?.id, username: raw.from?.name, createdAt: raw.created_time }
+    : { id: String(raw.id), text: String(raw.text ?? ''), commenterId: raw.from?.id, username: raw.from?.username ?? raw.username, postId: raw.media?.id, createdAt: raw.timestamp };
+}
+
+function accountFor(env: Env, platform: Comment['platform']): string | undefined {
+  return platform === 'facebook' ? env.FB_PAGE_ID : env.IG_ACCOUNT_ID;
+}
+
+const COMMENT_FIELDS = { instagram: 'id,text,timestamp,from,username,media', facebook: 'id,message,created_time,from' };
+
+/**
+ * Finds keyword comments from the last week that never got a DM. GET lists posts, or one page of a
+ * post's candidates. POST re-reads one comment from Meta and sends it through handleComment, so the
+ * caller can only trigger the normal reply, never choose its text or recipient.
+ */
+export async function handleBackfill(request: Request, env: Env, list: Keyword[]): Promise<Response> {
+  const key = request.headers.get('authorization')?.replace(/^Bearer /, '') ?? '';
+  if (!env.ADMIN_KEY || !await safeEqual(key, env.ADMIN_KEY)) return new Response('Forbidden', { status: 403 });
+  const url = new URL(request.url);
+  const json = (data: unknown, status = 200) => Response.json(data, { status });
+
+  if (request.method === 'POST') {
+    const { platform, post, comment } = (await request.json().catch(() => ({}))) as { platform?: Comment['platform']; post?: string; comment?: string };
+    if ((platform !== 'instagram' && platform !== 'facebook') || !post || !comment) return json({ error: 'bad request' }, 400);
+    const account = accountFor(env, platform);
+    const read = await graphGet(env, `?fields=${COMMENT_FIELDS[platform]}`, comment, tokenFor(env, platform));
+    if (!read.ok || !account) return json({ status: 'unreadable', error: read.status }, 200);
+    const fetched = readComment(platform, read.body);
+    const onPost = platform === 'facebook' ? fetched.id.startsWith(`${post.split('_')[1]}_`) : fetched.postId === post;
+    if (!onPost || !fetched.commenterId) return json({ status: 'mismatch' });
+    if (Date.now() - Date.parse(fetched.createdAt) > BACKFILL_MAX_AGE_MS) return json({ status: 'too_old' });
+    const match = matchKeyword(fetched.text, list);
+    if (!match) return json({ status: 'no_match' });
+    const full: Comment = { id: fetched.id, text: fetched.text, commenterId: fetched.commenterId, mediaId: post, accountId: account, platform };
+    await handleComment(env, full, list);
+    const row = await env.DB.prepare('SELECT status, error FROM deliveries WHERE dedupe_key = ?1')
+      .bind(`${post}:${fetched.commenterId}:${match.keyword.toLowerCase()}`).first<{ status: string; error: string | null }>();
+    return json({ status: row?.status ?? 'retry_later', error: row?.error ?? null });
+  }
+
+  const platform = url.searchParams.get('platform') as Comment['platform'] | null;
+  const post = url.searchParams.get('post');
+  if (!post) {
+    const ig = await graphGet(env, 'media?fields=id,timestamp,permalink&limit=15');
+    const fb = env.FB_PAGE_ID && env.FB_PAGE_TOKEN
+      ? await graphGet(env, 'posts?fields=id,created_time,permalink_url&limit=15', env.FB_PAGE_ID, env.FB_PAGE_TOKEN)
+      : { ok: true, status: 200, body: { data: [] } };
+    return json({
+      instagram: ig.ok ? ig.body.data.map((p: any) => ({ id: p.id, date: p.timestamp, link: p.permalink })) : { error: ig.status, detail: ig.body.error?.message },
+      facebook: fb.ok ? fb.body.data.map((p: any) => ({ id: p.id, date: p.created_time, link: p.permalink_url })) : { error: fb.status, detail: fb.body.error?.message },
+    });
+  }
+  if (platform !== 'instagram' && platform !== 'facebook') return json({ error: 'bad request' }, 400);
+  const account = accountFor(env, platform);
+  const after = url.searchParams.get('after');
+  const fields = COMMENT_FIELDS[platform].replace(',media', '');
+  const page = await graphGet(env, `comments?fields=${fields}&limit=50${platform === 'facebook' ? '&filter=stream' : ''}${after ? `&after=${encodeURIComponent(after)}` : ''}`, post, tokenFor(env, platform));
+  if (!page.ok) return json({ error: page.status, detail: page.body.error?.message }, 502);
+  const candidates = [];
+  let recent = 0;
+  for (const raw of page.body.data ?? []) {
+    const c = readComment(platform, raw);
+    if (Date.now() - Date.parse(c.createdAt) > BACKFILL_MAX_AGE_MS) continue;
+    recent++;
+    const match = matchKeyword(c.text, list);
+    if (!match || !c.commenterId || c.commenterId === account) continue;
+    const done = await env.DB.prepare('SELECT 1 FROM deliveries WHERE dedupe_key = ?1')
+      .bind(`${post}:${c.commenterId}:${match.keyword.toLowerCase()}`).first();
+    if (!done) candidates.push({ comment: c.id, username: c.username ?? null, text: c.text, keyword: match.keyword, date: c.createdAt });
+  }
+  return json({ candidates, recent, next: page.body.paging?.next ? page.body.paging.cursors?.after ?? null : null });
+}
+
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
+    if (url.pathname === '/admin/backfill') return handleBackfill(request, env, keywords);
     if (url.pathname === '/privacy') return new Response(privacyHtml(env), { headers: { 'content-type': 'text/html; charset=utf-8' } });
     if (url.pathname !== '/webhook') return new Response('Not found', { status: 404 });
     if (request.method === 'GET') return handleVerify(url, env);
